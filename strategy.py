@@ -1,17 +1,19 @@
+
+
+
+
 import pandas as pd
 import numpy as np
 
-def get_coin_metadata():
+def get_coin_metadata() -> dict:
     """
-    Define the coins and timeframes for the strategy.
-    Anchors: Major coins that lead the market
-    Targets: Coins we trade based on anchor signals
+    Defines the coins and timeframes for the strategy.
+    The user's selected coins are kept.
     """
     return {
         'anchors': [
             {'symbol': 'BTC', 'timeframe': '1H'},
             {'symbol': 'ETH', 'timeframe': '1H'},
-            {'symbol': 'SOL', 'timeframe': '1H'}
         ],
         'targets': [
             {'symbol': 'MATIC', 'timeframe': '1H'},
@@ -22,161 +24,107 @@ def get_coin_metadata():
         ]
     }
 
-def calculate_rsi(prices, period=14):
-    """Calculate RSI indicator"""
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def generate_signals(anchor_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    This is a hybrid strategy combining a Pairs Trading entry with robust risk management.
 
-def generate_signals(anchor_df, target_df):
+    - Entry: Buy when the target/anchor price ratio drops significantly below its average.
+    - Take Profit: Sell when the price ratio reverts back to its historical average.
+    - Stop-Loss: Sell if the asset's price drops by a fixed percentage from the entry price.
     """
-    Generate trading signals based on lead-lag relationships between anchors and targets.
-    """
-    signals = []
+    anchor_df = anchor_df.copy()
+    target_df = target_df.copy()
+    all_signals = []
     
-    # Strategy Parameters
-    LAG_WINDOW = 6  # hours to look back for momentum
-    MOMENTUM_THRESHOLD = 0.025  # 2.5% move threshold
-    POSITION_SIZE = 0.18  # 18% per position
-    MAX_POSITIONS = 4
+    # --- Parameters ---
+    primary_anchor = 'BTC'
+    lookback_period = 48
+    std_dev_multiplier = 2.0 # Widened the band slightly to look for more significant deviations
+    stop_loss_pct = 0.03   # 3% price-based stop-loss
+
+    # --- 1. Prepare Anchor Data ---
+    anchor_price_col = f'close_{primary_anchor}_1H'
+    if anchor_price_col not in anchor_df.columns:
+        primary_anchor = 'ETH'
+        anchor_price_col = f'close_{primary_anchor}_1H'
+        if anchor_price_col not in anchor_df.columns:
+            return pd.DataFrame()
     
-    # Calculate anchor momentum signals
-    anchor_momentum_cols = []
-    
-    for anchor in ['BTC', 'ETH', 'SOL']:
-        close_col = f'close_{anchor}_1H'
-        if close_col in anchor_df.columns:
-            # Calculate momentum over lag window
-            anchor_df.loc[:, f'{anchor}_momentum'] = anchor_df[close_col].pct_change(LAG_WINDOW)
-            
-            # Calculate volatility for normalization
-            anchor_df[f'{anchor}_vol'] = anchor_df[close_col].pct_change().rolling(24).std()
-            
-            # Volatility-adjusted momentum
-            anchor_df[f'{anchor}_adj_momentum'] = (
-                anchor_df[f'{anchor}_momentum'] / anchor_df[f'{anchor}_vol']
-            ).fillna(0)
-            
-            anchor_momentum_cols.append(f'{anchor}_momentum')
-    
-    # Calculate composite anchor signals
-    if anchor_momentum_cols:
-        anchor_df['composite_momentum'] = anchor_df[anchor_momentum_cols].mean(axis=1)
-    else:
-        anchor_df['composite_momentum'] = 0
-    
-    adj_momentum_cols = [col for col in anchor_df.columns if '_adj_momentum' in col]
-    if adj_momentum_cols:
-        anchor_df['composite_adj_momentum'] = anchor_df[adj_momentum_cols].mean(axis=1)
-    else:
-        anchor_df['composite_adj_momentum'] = 0
-    
-    # Track position states
-    position_tracker = {}
-    
-    # Generate signals for each target coin
-    for target in ['MATIC', 'AVAX', 'LINK', 'ADA', 'DOT']:
-        close_col = f'close_{target}_1H'
-        
-        if close_col not in target_df.columns:
+    anchor_prices = anchor_df[anchor_price_col].ffill()
+
+    # --- 2. Loop Through Each Target to Form a Pair ---
+    target_symbols = [t['symbol'] for t in get_coin_metadata()['targets']]
+
+    for symbol in target_symbols:
+        target_price_col = f'close_{symbol}_1H'
+        if target_price_col not in target_df.columns:
             continue
+
+        pair_df = pd.DataFrame({
+            'timestamp': target_df['timestamp'],
+            'target_price': target_df[target_price_col],
+            'anchor_price': anchor_prices
+        })
+
+        # --- 3. Calculate Ratio and Bands ---
+        pair_df['price_ratio'] = pair_df['target_price'] / pair_df['anchor_price']
+        pair_df['ratio_sma'] = pair_df['price_ratio'].rolling(window=lookback_period).mean()
+        pair_df['lower_band'] = pair_df['ratio_sma'] - (pair_df['price_ratio'].rolling(window=lookback_period).std() * std_dev_multiplier)
         
-        # Initialize position tracker for this target
-        position_tracker[target] = {'has_position': False, 'entry_time': None}
-        
-        # Merge anchor signals with target data
-        merged_df = pd.merge(
-            target_df[['timestamp', close_col]], 
-            anchor_df[['timestamp', 'composite_momentum', 'composite_adj_momentum']], 
-            on='timestamp', 
-            how='left'
-        )
-        
-        # Calculate target-specific indicators
-        merged_df['target_momentum'] = merged_df[close_col].pct_change(3)
-        merged_df['target_rsi'] = calculate_rsi(merged_df[close_col])
-        
-        # Generate signals for each timestamp
-        for i, row in merged_df.iterrows():
-            if pd.isna(row['composite_momentum']) or pd.isna(row['target_momentum']):
+        # --- 4. Generate Signals ---
+        pair_df['signal'] = 'HOLD'
+        pair_df['position_size'] = 0.0
+        in_position = False
+        entry_price = 0 
+
+        for i in range(1, len(pair_df)):
+            current_ratio = pair_df.at[i, 'price_ratio']
+            current_price = pair_df.at[i, 'target_price']
+            lower_band = pair_df.at[i, 'lower_band']
+            mean_ratio = pair_df.at[i, 'ratio_sma']
+            
+            if pd.isna(lower_band) or pd.isna(mean_ratio):
                 continue
-            
-            timestamp = row['timestamp']
-            composite_mom = row['composite_momentum']
-            composite_adj_mom = row['composite_adj_momentum']
-            target_mom = row['target_momentum']
-            target_rsi = row['target_rsi']
-            
-            # Calculate signal strength
-            recent_adj_std = merged_df['composite_adj_momentum'].rolling(48).std().iloc[i]
-            if pd.isna(recent_adj_std) or recent_adj_std == 0:
-                signal_strength = 1.0
-            else:
-                signal_strength = abs(composite_adj_mom) / recent_adj_std
-            
-            signal = 'HOLD'
-            position_size = 0
-            
-            current_position = position_tracker[target]['has_position']
-            
-            # Entry Logic: Strong anchor momentum + target lag + high confidence
-            if not current_position:
-                # Long entry: Positive anchor momentum, target hasn't moved
-                if (composite_mom > MOMENTUM_THRESHOLD and 
-                    abs(target_mom) < MOMENTUM_THRESHOLD/2 and 
-                    target_rsi < 70 and 
-                    signal_strength > 1.3):
-                    
-                    signal = 'BUY'
-                    position_size = POSITION_SIZE
-                    position_tracker[target]['has_position'] = True
-                    position_tracker[target]['entry_time'] = timestamp
                 
-                # Short entry: Negative anchor momentum, target hasn't dropped
-                elif (composite_mom < -MOMENTUM_THRESHOLD and 
-                      abs(target_mom) < MOMENTUM_THRESHOLD/2 and 
-                      target_rsi > 30 and 
-                      signal_strength > 1.3):
-                    
-                    # For backtester, we'll use BUY with negative position_size to indicate short
-                    signal = 'BUY'
-                    position_size = -POSITION_SIZE  # Negative for short
-                    position_tracker[target]['has_position'] = True
-                    position_tracker[target]['entry_time'] = timestamp
+            # BUY Signal: Ratio drops below the lower band
+            if not in_position and current_ratio < lower_band:
+                pair_df.at[i, 'signal'] = 'BUY'
+                pair_df.at[i, 'position_size'] = 0.2
+                in_position = True
+                entry_price = current_price # Store the asset's price at entry
             
-            # Exit Logic: Close positions when signals fade
-            else:
-                entry_time = position_tracker[target]['entry_time']
-                hours_held = (timestamp - entry_time).total_seconds() / 3600 if entry_time else 0
-                
-                # Exit conditions
-                should_exit = (
-                    abs(composite_mom) < MOMENTUM_THRESHOLD/3 or  # Momentum fading
-                    signal_strength < 0.8 or  # Low confidence
-                    hours_held >= 48 or  # Max hold time
-                    (composite_mom > 0 and target_mom > MOMENTUM_THRESHOLD) or  # Target caught up (long)
-                    (composite_mom < 0 and target_mom < -MOMENTUM_THRESHOLD)  # Target caught up (short)
-                )
-                
-                if should_exit:
-                    signal = 'SELL'
-                    position_size = 1.0  # Sell all
-                    position_tracker[target]['has_position'] = False
-                    position_tracker[target]['entry_time'] = None
+            # --- CORRECTED HYBRID SELL LOGIC ---
+            elif in_position and pd.notna(current_price):
+                # SELL Condition 1: Take profit if ratio reverts to mean
+                if current_ratio >= mean_ratio:
+                    pair_df.at[i, 'signal'] = 'SELL'
+                    pair_df.at[i, 'position_size'] = 1.0
+                    in_position = False
+                    entry_price = 0
+                # SELL Condition 2: Stop-loss if asset price drops 3%
+                elif (current_price - entry_price) / entry_price <= -stop_loss_pct:
+                    pair_df.at[i, 'signal'] = 'SELL'
+                    pair_df.at[i, 'position_size'] = 1.0
+                    in_position = False
+                    entry_price = 0
+                # If no sell condition is met, continue to HOLD
+                else:
+                    pair_df.at[i, 'signal'] = 'HOLD'
+                    pair_df.at[i, 'position_size'] = 0.2
             
-            # Add signal to results
-            signals.append({
-                'timestamp': timestamp,
-                'symbol': target,
-                'signal': signal,
-                'position_size': position_size,
-                'anchor_momentum': composite_mom,
-                'target_momentum': target_mom,
-                'signal_strength': signal_strength,
-                'target_rsi': target_rsi
-            })
+            # If in position but price is missing, just HOLD
+            elif in_position:
+                pair_df.at[i, 'signal'] = 'HOLD'
+                pair_df.at[i, 'position_size'] = 0.2
+
+        pair_df['symbol'] = symbol
+        all_signals.append(pair_df[['timestamp', 'symbol', 'signal', 'position_size']])
     
-    return pd.DataFrame(signals)
+    # --- 5. Combine and Return Final Signals ---
+    if not all_signals:
+        return pd.DataFrame()
+        
+    full_signals_df = pd.concat(all_signals).sort_values(['timestamp', 'symbol']).reset_index(drop=True)
+    return full_signals_df
+
+
