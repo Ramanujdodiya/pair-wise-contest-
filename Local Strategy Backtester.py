@@ -8,11 +8,12 @@ def run_backtest():
     Runs a full backtest simulation of the strategy defined in strategy.py.
     It fetches data, generates signals, simulates trades, and calculates
     performance metrics against the contest's minimum cutoffs.
+    VERSION 2: Includes partial sells and enhanced reporting.
     """
-    print("--- Starting Local Backtest Simulation ---")
+    print("--- Starting Local Backtest Simulation (v2) ---")
 
     # --- 1. Get Strategy Metadata and Market Data ---
-    print("\n[Step 1/5] Fetching market data based on your strategy's coin selection...")
+    print("\n[Step 1/5] Fetching market data...")
     try:
         metadata = strategy.get_coin_metadata()
         data_manager = CryptoDataManager()
@@ -24,7 +25,6 @@ def run_backtest():
 
         full_df = data_manager.get_market_data(all_configs)
         
-        # Separate anchor and target dataframes as required by the strategy
         anchor_cols = ['timestamp'] + [col for col in full_df.columns if any(f"_{coin['symbol']}_{coin['timeframe']}" in col for coin in metadata.get('anchors', []))]
         target_cols = ['timestamp'] + [col for col in full_df.columns if any(f"_{coin['symbol']}_{coin['timeframe']}" in col for coin in metadata.get('targets', []))]
         anchor_df = full_df[list(dict.fromkeys(anchor_cols))]
@@ -35,7 +35,7 @@ def run_backtest():
         return
 
     # --- 2. Generate Trading Signals ---
-    print("\n[Step 2/5] Generating trading signals from your strategy...")
+    print("\n[Step 2/5] Generating trading signals...")
     try:
         signals_df = strategy.generate_signals(anchor_df, target_df)
         print("  Signals generated successfully.")
@@ -44,11 +44,9 @@ def run_backtest():
         return
         
     # --- 3. Prepare Data for Simulation ---
-    print("\n[Step 3/5] Preparing data for trade simulation...")
-    # We need the 1H close price of each target coin to execute trades
+    print("\n[Step 3/5] Preparing data for simulation...")
     price_cols_to_merge = ['timestamp']
     for coin in metadata.get('targets', []):
-        # Assumes target timeframe is 1H for price execution as per contest structure
         price_col = f"close_{coin['symbol']}_1H" 
         if price_col in full_df.columns:
             price_cols_to_merge.append(price_col)
@@ -60,13 +58,12 @@ def run_backtest():
     print("\n[Step 4/5] Simulating trades hour-by-hour...")
     initial_capital = 10000.0
     cash = initial_capital
-    portfolio_value = initial_capital
-    positions = {target['symbol']: {'shares': 0, 'avg_cost': 0} for target in metadata.get('targets', [])}
     portfolio_history = []
-    fee_pct = 0.001 # 0.1% trading fee, as per simulator rules
+    positions = {target['symbol']: {'shares': 0, 'avg_cost': 0} for target in metadata.get('targets', [])}
+    trade_log = []
+    fee_pct = 0.001
 
     for i, row in sim_df.iterrows():
-        # Update portfolio value at the start of each hour BEFORE any trades
         current_holdings_value = 0
         for pos_symbol, pos_data in positions.items():
             price_col = f"close_{pos_symbol}_1H"
@@ -78,7 +75,6 @@ def run_backtest():
         portfolio_value = cash + current_holdings_value
         portfolio_history.append(portfolio_value)
 
-        # Execute trades for the current hour
         symbol = row['symbol']
         signal = row['signal']
         pos_size = row['position_size']
@@ -95,19 +91,32 @@ def run_backtest():
             shares_to_buy = actual_investment / price
             
             cash -= investment_amount
+            
             old_shares = positions[symbol]['shares']
             old_cost = positions[symbol]['avg_cost']
             new_shares = old_shares + shares_to_buy
             if new_shares > 0:
                 positions[symbol]['avg_cost'] = ((old_cost * old_shares) + (price * shares_to_buy)) / new_shares
             positions[symbol]['shares'] += shares_to_buy
+            trade_log.append({'type': 'BUY', 'symbol': symbol, 'price': price, 'pnl': 0})
 
-        elif signal == 'SELL' and positions[symbol]['shares'] > 0:
-            shares_to_sell = positions[symbol]['shares'] # Sells entire position
-            sale_value = shares_to_sell * price
-            fee = sale_value * fee_pct
-            cash += (sale_value - fee)
-            positions[symbol] = {'shares': 0, 'avg_cost': 0}
+        elif signal == 'SELL' and positions[symbol]['shares'] > 0 and pos_size > 0:
+            # --- UPDATED SELL LOGIC ---
+            # Now respects pos_size for partial sells.
+            shares_to_sell = positions[symbol]['shares'] * pos_size
+            
+            if shares_to_sell > 0:
+                sale_value = shares_to_sell * price
+                fee = sale_value * fee_pct
+                cash += (sale_value - fee)
+                
+                # Log profit/loss for this sell
+                pnl = (price - positions[symbol]['avg_cost']) * shares_to_sell
+                trade_log.append({'type': 'SELL', 'symbol': symbol, 'price': price, 'pnl': pnl})
+
+                positions[symbol]['shares'] -= shares_to_sell
+                if positions[symbol]['shares'] < 1e-9: # Reset if effectively zero
+                    positions[symbol] = {'shares': 0, 'avg_cost': 0}
 
     print("  Simulation complete.")
 
@@ -115,27 +124,32 @@ def run_backtest():
     print("\n[Step 5/5] Calculating performance metrics...")
     returns = pd.Series(portfolio_history).pct_change().fillna(0)
     
-    # Profitability
     final_value = portfolio_history[-1]
     total_return_pct = ((final_value / initial_capital) - 1) * 100
     
-    # Sharpe Ratio (annualized for hourly data)
     trading_hours_per_year = 365 * 24
     sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(trading_hours_per_year) if returns.std() > 0 else 0
 
-    # Max Drawdown
     cumulative_returns = (1 + returns).cumprod()
     peak = cumulative_returns.expanding(min_periods=1).max()
     drawdown = (cumulative_returns / peak) - 1
     max_drawdown_pct = abs(drawdown.min() * 100)
+    
+    # --- ENHANCED REPORTING ---
+    sells = [t for t in trade_log if t['type'] == 'SELL']
+    wins = [t for t in sells if t['pnl'] > 0]
+    total_trades = len(sells)
+    win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
 
     print("\n" + "="*40)
     print("---           BACKTEST RESULTS           ---")
     print("="*40)
     print(f"Initial Capital:       ${initial_capital:,.2f}")
     print(f"Final Portfolio Value:   ${final_value:,.2f}")
-    
-    # Check against cutoffs
+    print("\n--- Strategy Behavior ---")
+    print(f"Total Trades (Sells):    {total_trades}")
+    print(f"Win Rate:                {win_rate:.2f}%")
+
     profit_check = "✅" if total_return_pct >= 5 else "❌"
     sharpe_check = "✅" if sharpe_ratio >= 0.5 else "❌"
     drawdown_check = "✅" if max_drawdown_pct <= 50 else "❌"
@@ -148,4 +162,3 @@ def run_backtest():
 
 if __name__ == "__main__":
     run_backtest()
-

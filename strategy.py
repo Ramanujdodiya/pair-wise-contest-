@@ -1,184 +1,182 @@
 import pandas as pd
 import numpy as np
 
-def get_coin_metadata() -> dict:
+def get_coin_metadata():
+    """
+    Define the coins and timeframes for the strategy.
+    Anchors: Major coins that lead the market
+    Targets: Coins we trade based on anchor signals
+    """
     return {
-        "targets": [
-            {"symbol": "LDO", "timeframe": "1H"},
-            {"symbol": "PEPE", "timeframe": "1H"},
-            {"symbol": "BONK", "timeframe": "1H"}
+        'anchors': [
+            {'symbol': 'BTC', 'timeframe': '1H'},
+            {'symbol': 'ETH', 'timeframe': '1H'},
+            {'symbol': 'SOL', 'timeframe': '1H'}
         ],
-        "anchors": [
-            {"symbol": "BTC", "timeframe": "4H"},
-            {"symbol": "ETH", "timeframe": "4H"},
-            {"symbol": "SOL", "timeframe": "1D"}
+        'targets': [
+            {'symbol': 'MATIC', 'timeframe': '1H'},
+            {'symbol': 'AVAX', 'timeframe': '1H'},
+            {'symbol': 'LINK', 'timeframe': '1H'},
+            {'symbol': 'ADA', 'timeframe': '1H'},
+            {'symbol': 'DOT', 'timeframe': '1H'}
         ]
     }
 
-def generate_signals(anchor_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
-    result = []
+def calculate_rsi(prices, period=14):
+    """Calculate RSI indicator"""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-    # Detect all target symbols and iterate
-    target_symbols = set(col.split('_')[1] for col in target_df.columns if col.startswith('close_'))
-
-    for symbol in target_symbols:
-        close_col = f'close_{symbol}_1H'
+def generate_signals(anchor_df, target_df):
+    """
+    Generate trading signals based on lead-lag relationships between anchors and targets.
+    """
+    signals = []
+    
+    # Strategy Parameters
+    LAG_WINDOW = 6  # hours to look back for momentum
+    MOMENTUM_THRESHOLD = 0.025  # 2.5% move threshold
+    POSITION_SIZE = 0.18  # 18% per position
+    MAX_POSITIONS = 4
+    
+    # Calculate anchor momentum signals
+    anchor_momentum_cols = []
+    
+    for anchor in ['BTC', 'ETH', 'SOL']:
+        close_col = f'close_{anchor}_1H'
+        if close_col in anchor_df.columns:
+            # Calculate momentum over lag window
+            anchor_df.loc[:, f'{anchor}_momentum'] = anchor_df[close_col].pct_change(LAG_WINDOW)
+            
+            # Calculate volatility for normalization
+            anchor_df[f'{anchor}_vol'] = anchor_df[close_col].pct_change().rolling(24).std()
+            
+            # Volatility-adjusted momentum
+            anchor_df[f'{anchor}_adj_momentum'] = (
+                anchor_df[f'{anchor}_momentum'] / anchor_df[f'{anchor}_vol']
+            ).fillna(0)
+            
+            anchor_momentum_cols.append(f'{anchor}_momentum')
+    
+    # Calculate composite anchor signals
+    if anchor_momentum_cols:
+        anchor_df['composite_momentum'] = anchor_df[anchor_momentum_cols].mean(axis=1)
+    else:
+        anchor_df['composite_momentum'] = 0
+    
+    adj_momentum_cols = [col for col in anchor_df.columns if '_adj_momentum' in col]
+    if adj_momentum_cols:
+        anchor_df['composite_adj_momentum'] = anchor_df[adj_momentum_cols].mean(axis=1)
+    else:
+        anchor_df['composite_adj_momentum'] = 0
+    
+    # Track position states
+    position_tracker = {}
+    
+    # Generate signals for each target coin
+    for target in ['MATIC', 'AVAX', 'LINK', 'ADA', 'DOT']:
+        close_col = f'close_{target}_1H'
+        
         if close_col not in target_df.columns:
             continue
-
-        df = target_df[['timestamp', close_col]].copy()
-        df.rename(columns={close_col: 'close'}, inplace=True)
-
-        # Calculate SMAs
-        df['sma_fast'] = df['close'].rolling(window=8).mean()
-        df['sma_slow'] = df['close'].rolling(window=21).mean()
-
-        # Entry/exit signals
-        df['signal'] = 'HOLD'
-        df['position_size'] = 0.0
-
-        in_position = False
-        entry_price = None
-
-        for i in range(len(df)):
-            price = df['close'].iloc[i]
-            fast = df['sma_fast'].iloc[i]
-            slow = df['sma_slow'].iloc[i]
-
-            if pd.isna(fast) or pd.isna(slow):
+        
+        # Initialize position tracker for this target
+        position_tracker[target] = {'has_position': False, 'entry_time': None}
+        
+        # Merge anchor signals with target data
+        merged_df = pd.merge(
+            target_df[['timestamp', close_col]], 
+            anchor_df[['timestamp', 'composite_momentum', 'composite_adj_momentum']], 
+            on='timestamp', 
+            how='left'
+        )
+        
+        # Calculate target-specific indicators
+        merged_df['target_momentum'] = merged_df[close_col].pct_change(3)
+        merged_df['target_rsi'] = calculate_rsi(merged_df[close_col])
+        
+        # Generate signals for each timestamp
+        for i, row in merged_df.iterrows():
+            if pd.isna(row['composite_momentum']) or pd.isna(row['target_momentum']):
                 continue
-
-            # Buy signal: fast crosses above slow
-            if not in_position and fast > slow and df['sma_fast'].iloc[i - 1] <= df['sma_slow'].iloc[i - 1]:
-                df.at[i, 'signal'] = 'BUY'
-                df.at[i, 'position_size'] = 0.7
-                in_position = True
-                entry_price = price
-
-            # Sell signal: 5% profit or 3% stop-loss
-            elif in_position and pd.notna(price) and entry_price:
-                pnl = (price - entry_price) / entry_price
-                if pnl >= 0.05 or pnl <= -0.03:
-                    df.at[i, 'signal'] = 'SELL'
-                    df.at[i, 'position_size'] = 0.0
-                    in_position = False
-                    entry_price = None
-                else:
-                    df.at[i, 'signal'] = 'HOLD'
-                    df.at[i, 'position_size'] = 0.7
-            elif in_position:
-                df.at[i, 'signal'] = 'HOLD'
-                df.at[i, 'position_size'] = 0.7
-
-        df['symbol'] = symbol
-        result.append(df[['timestamp', 'symbol', 'signal', 'position_size']])
-
-    full_signals = pd.concat(result).sort_values(['timestamp', 'symbol']).reset_index(drop=True)
-
-    # Constraint check: ensure all signals are valid
-    valid_signals = {"BUY", "SELL", "HOLD"}
-    for idx, row in full_signals.iterrows():
-        if row['signal'] not in valid_signals:
-            raise ValueError(f"Invalid signal '{row['signal']}' at {row['timestamp']}")
-        if not (0.0 <= row['position_size'] <= 1.0):
-            raise ValueError(f"Invalid position_size {row['position_size']} at {row['timestamp']}")
-        if row['signal'] == "BUY" and row['position_size'] == 0.0:
-            raise ValueError(f"BUY signal with zero position_size at {row['timestamp']}")
-        if row['signal'] == "SELL" and row['position_size'] != 0.0:
-            raise ValueError(f"SELL signal must have position_size 0.0 at {row['timestamp']}")
-
-    return full_signals
-
-# def generate_signals(anchor_df: pd.DataFrame, target_df: pd.DataFrame) -> pd.DataFrame:
-#     result = []
-#     anchor_df = anchor_df.copy()
-#     target_df = target_df.copy()
-#     # First, forward-fill the prices and SMAs to handle different timeframes
-#     btc_price = anchor_df['close_BTC_4H'].ffill()
-#     eth_price = anchor_df['close_ETH_4H'].ffill()
-#     btc_sma = anchor_df['close_BTC_4H'].rolling(10).mean().ffill()
-#     eth_sma = anchor_df['close_ETH_4H'].rolling(10).mean().ffill()
-
-# # Now, create the trend signal. This will give us a valid True/False for every hour.
-#     anchor_df['anchor_trend'] = (btc_price > btc_sma) | (eth_price > eth_sma)
-
-
-#     target_symbols = set(col.split('_')[1] for col in target_df.columns if col.startswith('close_'))
-
-#     for symbol in target_symbols:
-#         close_col = f'close_{symbol}_1H'
-#         if close_col not in target_df.columns:
-#             continue
-
-#         # Merge with anchor trend
-#         df = pd.merge(
-#             target_df[['timestamp', close_col]].rename(columns={close_col: 'close'}),
-#             anchor_df[['timestamp', 'anchor_trend']],
-#             on='timestamp',
-#             how='left'
-#         ).sort_values('timestamp').reset_index(drop=True)
-
-#         # Calculate SMAs for the target
-#         df['sma_fast'] = df['close'].rolling(window=8).mean()
-#         df['sma_slow'] = df['close'].rolling(window=21).mean()
-
-#         # Initialize trading logic
-#         df['signal'] = 'HOLD'
-#         df['position_size'] = 0.0
-#         in_position = False
-#         entry_price = None
-
-#         for i in range(len(df)):
-#             price = df['close'].iloc[i]
-#             fast = df['sma_fast'].iloc[i]
-#             slow = df['sma_slow'].iloc[i]
-#             anchor_ok = df['anchor_trend'].iloc[i]
-
-#             if pd.isna(fast) or pd.isna(slow) or pd.isna(anchor_ok):
-#                 continue
-
-#             # Buy only if crossover + anchor trend is bullish
-#             if (
-#                 not in_position and
-#                 fast > slow and
-#                 df['sma_fast'].iloc[i - 1] <= df['sma_slow'].iloc[i - 1] and
-#                 anchor_ok
-#             ):
-#                 df.at[i, 'signal'] = 'BUY'
-#                 df.at[i, 'position_size'] = 0.7
-#                 in_position = True
-#                 entry_price = price
-
-#             # Sell if profit > 5% or loss > 3%
-#             elif in_position and pd.notna(price) and entry_price:
-#                 pnl = (price - entry_price) / entry_price
-#                 if pnl >= 0.05 or pnl <= -0.03:
-#                     df.at[i, 'signal'] = 'SELL'
-#                     df.at[i, 'position_size'] = 0.0
-#                     in_position = False
-#                     entry_price = None
-#                 else:
-#                     df.at[i, 'signal'] = 'HOLD'
-#                     df.at[i, 'position_size'] = 0.7
-#             elif in_position:
-#                 df.at[i, 'signal'] = 'HOLD'
-#                 df.at[i, 'position_size'] = 0.7
-
-#         df['symbol'] = symbol
-#         result.append(df[['timestamp', 'symbol', 'signal', 'position_size']])
-
-#     full_signals = pd.concat(result).sort_values(['timestamp', 'symbol']).reset_index(drop=True)
-
-#     # Final constraint check
-#     valid_signals = {"BUY", "SELL", "HOLD"}
-#     for idx, row in full_signals.iterrows():
-#         if row['signal'] not in valid_signals:
-#             raise ValueError(f"Invalid signal '{row['signal']}' at {row['timestamp']}")
-#         if not (0.0 <= row['position_size'] <= 1.0):
-#             raise ValueError(f"Invalid position_size {row['position_size']} at {row['timestamp']}")
-#         if row['signal'] == "BUY" and row['position_size'] == 0.0:
-#             raise ValueError(f"BUY signal with zero position_size at {row['timestamp']}")
-#         if row['signal'] == "SELL" and row['position_size'] != 0.0:
-#             raise ValueError(f"SELL signal must have position_size 0.0 at {row['timestamp']}")
-
-#     return full_signals
+            
+            timestamp = row['timestamp']
+            composite_mom = row['composite_momentum']
+            composite_adj_mom = row['composite_adj_momentum']
+            target_mom = row['target_momentum']
+            target_rsi = row['target_rsi']
+            
+            # Calculate signal strength
+            recent_adj_std = merged_df['composite_adj_momentum'].rolling(48).std().iloc[i]
+            if pd.isna(recent_adj_std) or recent_adj_std == 0:
+                signal_strength = 1.0
+            else:
+                signal_strength = abs(composite_adj_mom) / recent_adj_std
+            
+            signal = 'HOLD'
+            position_size = 0
+            
+            current_position = position_tracker[target]['has_position']
+            
+            # Entry Logic: Strong anchor momentum + target lag + high confidence
+            if not current_position:
+                # Long entry: Positive anchor momentum, target hasn't moved
+                if (composite_mom > MOMENTUM_THRESHOLD and 
+                    abs(target_mom) < MOMENTUM_THRESHOLD/2 and 
+                    target_rsi < 70 and 
+                    signal_strength > 1.3):
+                    
+                    signal = 'BUY'
+                    position_size = POSITION_SIZE
+                    position_tracker[target]['has_position'] = True
+                    position_tracker[target]['entry_time'] = timestamp
+                
+                # Short entry: Negative anchor momentum, target hasn't dropped
+                elif (composite_mom < -MOMENTUM_THRESHOLD and 
+                      abs(target_mom) < MOMENTUM_THRESHOLD/2 and 
+                      target_rsi > 30 and 
+                      signal_strength > 1.3):
+                    
+                    # For backtester, we'll use BUY with negative position_size to indicate short
+                    signal = 'BUY'
+                    position_size = -POSITION_SIZE  # Negative for short
+                    position_tracker[target]['has_position'] = True
+                    position_tracker[target]['entry_time'] = timestamp
+            
+            # Exit Logic: Close positions when signals fade
+            else:
+                entry_time = position_tracker[target]['entry_time']
+                hours_held = (timestamp - entry_time).total_seconds() / 3600 if entry_time else 0
+                
+                # Exit conditions
+                should_exit = (
+                    abs(composite_mom) < MOMENTUM_THRESHOLD/3 or  # Momentum fading
+                    signal_strength < 0.8 or  # Low confidence
+                    hours_held >= 48 or  # Max hold time
+                    (composite_mom > 0 and target_mom > MOMENTUM_THRESHOLD) or  # Target caught up (long)
+                    (composite_mom < 0 and target_mom < -MOMENTUM_THRESHOLD)  # Target caught up (short)
+                )
+                
+                if should_exit:
+                    signal = 'SELL'
+                    position_size = 1.0  # Sell all
+                    position_tracker[target]['has_position'] = False
+                    position_tracker[target]['entry_time'] = None
+            
+            # Add signal to results
+            signals.append({
+                'timestamp': timestamp,
+                'symbol': target,
+                'signal': signal,
+                'position_size': position_size,
+                'anchor_momentum': composite_mom,
+                'target_momentum': target_mom,
+                'signal_strength': signal_strength,
+                'target_rsi': target_rsi
+            })
+    
+    return pd.DataFrame(signals)
